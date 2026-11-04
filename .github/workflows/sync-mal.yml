@@ -1,0 +1,200 @@
+# Anime Mind Map - pulls every ranked anime from MyAnimeList into index.html.
+# Runs when you press "Run workflow" (Actions tab), and every Monday automatically.
+# Optional: add a free MyAnimeList Client ID as a repository secret named MAL_CLIENT_ID
+# to use MyAnimeList's official API (faster and more reliable).
+name: Sync anime from MyAnimeList
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: sync-mal
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the connection
+        run: |
+          echo "Addresses for api.jikan.moe:"; getent ahostsv4 api.jikan.moe | head -3 || echo "  (no IPv4 address found)"
+          echo "Jikan test:"; curl -4 -s -o /dev/null -w "  HTTP %{http_code}\n" --max-time 30 https://api.jikan.moe/v4/anime/1 || echo "  could not connect"
+          echo "MyAnimeList official API test:"; curl -4 -s -o /dev/null -w "  HTTP %{http_code} (401 here is normal)\n" --max-time 30 https://api.myanimelist.net/v2/anime/1 || echo "  could not connect"
+
+      - name: Pull the MyAnimeList rankings into index.html
+        env:
+          MAL_CLIENT_ID: ${{ secrets.MAL_CLIENT_ID }}
+        run: |
+          python3 - <<'PY'
+          # Anime Mind Map: pull every ranked anime from MyAnimeList into index.html.
+          # Uses MyAnimeList's official API when a MAL_CLIENT_ID secret is set, otherwise the free Jikan API.
+          import json, re, time, urllib.request, urllib.error, urllib.parse, sys, datetime, os, socket
+
+          # --- connect over IPv4 (GitHub's machines can't reach IPv6 addresses) ---
+          _getaddrinfo = socket.getaddrinfo
+          def _v4_first(host, port, family=0, type=0, proto=0, flags=0):
+              try:
+                  res = _getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+                  if res:
+                      return res
+              except socket.gaierror:
+                  pass
+              return _getaddrinfo(host, port, family, type, proto, flags)
+          socket.getaddrinfo = _v4_first
+
+          FILE = "index.html"
+          CLIENT_ID = os.environ.get("MAL_CLIENT_ID", "").strip()
+          WAITS = [5, 10, 20, 30, 45, 60, 90, 120, 120, 120]
+          UA = {"User-Agent": "anime-mind-map-sync (GitHub Actions)"}
+
+          def fetch_json(url, headers=None):
+              last = ""
+              for wait in [0] + WAITS:
+                  if wait:
+                      print(f"  {last} - retrying in {wait}s", flush=True)
+                      time.sleep(wait)
+                  try:
+                      req = urllib.request.Request(url, headers={**UA, **(headers or {})})
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          return json.loads(r.read().decode("utf-8"))
+                  except urllib.error.HTTPError as e:
+                      last = f"HTTP {e.code} from {urllib.parse.urlparse(url).netloc}"
+                      if e.code in (401, 403) and CLIENT_ID:
+                          sys.exit("MyAnimeList rejected the Client ID - check the MAL_CLIENT_ID secret (see instructions).")
+                      if e.code != 429 and e.code < 500:
+                          raise
+                  except Exception as e:
+                      last = f"{e} ({urllib.parse.urlparse(url).netloc})"
+              raise RuntimeError(f"kept failing: {last}")
+
+          DEMOS = {"Shounen", "Shoujo", "Seinen", "Josei", "Kids"}
+          GENRES = {"Action", "Adventure", "Avant Garde", "Award Winning", "Boys Love", "Comedy", "Drama", "Fantasy", "Girls Love",
+                    "Gourmet", "Horror", "Mystery", "Romance", "Sci-Fi", "Slice of Life", "Sports", "Supernatural", "Suspense",
+                    "Ecchi", "Erotica", "Hentai"}
+          TYPES = {"tv": "TV", "movie": "Movie", "ova": "OVA", "ona": "ONA", "special": "Special", "tv_special": "TV Special",
+                   "music": "Music", "pv": "PV", "cm": "CM", "unknown": ""}
+          MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+          def nice_date(d):
+              if not d: return ""
+              p = d.split("-")
+              return (MON[int(p[1]) - 1] + " " + p[0]) if len(p) >= 2 else p[0]
+
+          def from_official():
+              """MyAnimeList's official API: 500 anime per request (needs a free Client ID)."""
+              fields = "id,title,alternative_titles,mean,rank,media_type,num_episodes,start_date,end_date,genres,rating"
+              url = f"https://api.myanimelist.net/v2/anime/ranking?ranking_type=all&limit=500&nsfw=true&fields={fields}"
+              while url:
+                  page = fetch_json(url, {"X-MAL-CLIENT-ID": CLIENT_ID})
+                  for item in page.get("data", []):
+                      n = item["node"]
+                      g = [x["name"] for x in n.get("genres", [])]
+                      start, end = nice_date(n.get("start_date")), nice_date(n.get("end_date"))
+                      yield n["id"], {
+                          "rank": (item.get("ranking") or {}).get("rank") or n.get("rank"),
+                          "title": n.get("title") or "", "titleEn": (n.get("alternative_titles") or {}).get("en") or n.get("title") or "",
+                          "score": n.get("mean"), "type": TYPES.get(n.get("media_type") or "", (n.get("media_type") or "").upper()),
+                          "episodes": str(n["num_episodes"]) if n.get("num_episodes") else "?",
+                          "aired": start + (" - " + end if end and end != start else (" -" if not end and start else "")),
+                          "genres": [x for x in g if x in GENRES], "themes": [x for x in g if x not in GENRES and x not in DEMOS],
+                          "demographic": next((x for x in g if x in DEMOS), ""),
+                      }, (n.get("rating") == "rx" or "Hentai" in g)
+                  url = (page.get("paging") or {}).get("next")
+                  time.sleep(1.0)
+
+          def from_jikan():
+              """The free Jikan API: 25 anime per request."""
+              names = lambda lst: [x["name"] for x in (lst or [])]
+              first = fetch_json("https://api.jikan.moe/v4/top/anime?page=1")
+              last_page = (first.get("pagination") or {}).get("last_visible_page", 1)
+              print(f"MyAnimeList has {last_page} pages of ranked anime", flush=True)
+              for p in range(1, last_page + 1):
+                  data = first if p == 1 else fetch_json(f"https://api.jikan.moe/v4/top/anime?page={p}")
+                  for x in data.get("data", []):
+                      g = names(x.get("genres")) + names(x.get("explicit_genres"))
+                      yield x["mal_id"], {
+                          "rank": x.get("rank"), "title": x.get("title") or "", "titleEn": x.get("title_english") or x.get("title") or "",
+                          "score": x.get("score"), "type": x.get("type") or "",
+                          "episodes": "?" if x.get("episodes") is None else str(x["episodes"]),
+                          "aired": (x.get("aired") or {}).get("string") or "",
+                          "genres": g, "themes": names(x.get("themes")), "demographic": (names(x.get("demographics")) or [""])[0],
+                      }, ((x.get("rating") or "").startswith("Rx") or "Hentai" in g)
+                  if p % 25 == 0:
+                      print(f"page {p}/{last_page}", flush=True)
+                  time.sleep(1.3)
+
+          def default_links(en):
+              base = re.split(r" Season|:| -", en)[0].strip() or en
+              q = urllib.parse.quote(base)
+              free = [{"name": "Tubi", "url": "https://tubitv.com/search/" + q},
+                      {"name": "Pluto TV", "url": "https://pluto.tv/search/details?query=" + q},
+                      {"name": "YouTube (official channels)", "url": "https://www.youtube.com/results?search_query=" + urllib.parse.quote(en + " full episode official")}]
+              paid = [{"name": "Crunchyroll", "url": "https://www.crunchyroll.com/search?q=" + q},
+                      {"name": "Netflix", "url": "https://www.netflix.com/search?q=" + q}]
+              return free, paid
+
+          def main():
+              html = open(FILE, encoding="utf-8").read()
+              tag = '<script id="seed" type="application/json">'
+              s = html.index(tag) + len(tag)
+              e = html.index("</script>", s)
+              seed = json.loads(html[s:e])
+              idx = {str(a["id"]): a for a in seed["anime"]}
+              source = from_official() if CLIENT_ID else from_jikan()
+              print("Using " + ("MyAnimeList's official API" if CLIENT_ID else "the free Jikan API"), flush=True)
+              seen, added, updated = set(), 0, 0
+              for mid, fields, adult in source:
+                  fid = str(mid)
+                  if fid in seen:
+                      continue
+                  seen.add(fid)
+                  if adult:
+                      fields["adult"] = True
+                  a = idx.get(fid)
+                  if a:
+                      if a.get("edited"):          # keep your own edits; only refresh rank & score
+                          a["rank"], a["score"] = fields["rank"], fields["score"]
+                      else:
+                          a.update(fields)
+                      updated += 1
+                  else:
+                      free, paid = ([], []) if adult else default_links(fields["titleEn"])
+                      a = {"id": mid, **fields, "free": free, "paid": paid, "franchise": ""}
+                      seed["anime"].append(a); idx[fid] = a; added += 1
+                  if len(seen) % 1000 == 0:
+                      print(f"{len(seen)} anime so far", flush=True)
+              if len(seen) < 1000:
+                  sys.exit(f"Only got {len(seen)} anime - something went wrong, so nothing was changed.")
+              for a in seed["anime"]:
+                  if isinstance(a.get("id"), int) and str(a["id"]) not in seen:
+                      a["rank"] = None
+              now = datetime.datetime.now(datetime.timezone.utc)
+              seed["stamp"] = "gh-" + now.strftime("%Y%m%d%H%M%S")
+              seed["source"] = "https://myanimelist.net/topanime.php (synced " + now.strftime("%b %d, %Y") + ")"
+              out = json.dumps(seed, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+              open(FILE, "w", encoding="utf-8").write(html[:s] + out + html[e:])
+              print(f"Done: {added} new anime, {updated} updated, {len(seed['anime'])} total.", flush=True)
+
+          main()
+          PY
+
+      - name: Save the updated site
+        run: |
+          git config user.name "anime-mind-map-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then echo "No changes."; exit 0; fi
+          git commit -m "Sync anime from MyAnimeList"
+          git push
+
+      - name: Republish the website
+        run: |
+          curl -s -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/pages/builds" || true
